@@ -1,0 +1,13 @@
+{
+    "name": "Template Workflow",
+    "description": "StaticOwl CI workflow template.",
+    "iconName": "example-icon",
+    "categories": [
+        "Java"
+    ],
+    "filePatterns": [
+        "package.json$",
+        "^Dockerfile",
+        ".*\\.md$"
+    ]
+}
