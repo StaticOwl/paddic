@@ -7,6 +7,11 @@ from bs4 import BeautifulSoup
 from huggingface_hub import login
 from transformers import pipeline
 
+# #Read
+# # login(token="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")
+# #Write
+# login(token="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")
+
 pipe = pipeline("text-classification", model="michellejieli/NSFW_text_classifier")
 os_type = platform.system()
 
