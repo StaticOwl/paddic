@@ -6,9 +6,15 @@ from bs4 import BeautifulSoup
 from huggingface_hub import login
 from transformers import pipeline
 import psutil
-import notification
+from plyer import notification
 from PIL import Image
 from io import BytesIO
+import re
+import pygetwindow as gw
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 
 # #Read
 # # login(token="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")
@@ -19,13 +25,20 @@ text_pipe = pipeline("text-classification", model="eliasalbouzidi/distilbert-nsf
 image_pipe = pipeline("image-classification", model="Falconsai/nsfw_image_detection")
 os_type = platform.system()
 
-previous_urls = set()
-
 BROWSER_PROCESSES = {
     "chrome" : "chrome.exe",
     "edge" : "msedge.exe",
     "brave" : "brave.exe"
 }
+
+WHITELISTED_PATTERNS = [
+    r"google\.com",
+    r"wikipedia\.org",
+    r"github\.com",
+    r"stackoverflow\.com",
+    r"youtube\.com",
+    r"chatgpt\.com"
+]
 
 def is_browser_running():
     for proc in psutil.process_iter(['pid', 'name']):
@@ -49,6 +62,58 @@ def is_debugging_active():
         return response.status_code == 200
     except requests.RequestException:
         return False
+
+def get_tabs_from_devtools():
+    try:
+        response = requests.get("http://localhost:9222/json", timeout=2)
+        if response.status_code == 200:
+            return response.json()
+    except requests.RequestException as e:
+        print(f"Error fetching tabs from DevTools: {e}")
+    return []
+
+def update_tab_urls(opened_tabs, not_found_tabs):
+    devtools_tabs = get_tabs_from_devtools()
+    for tab in devtools_tabs:
+        tab_id = tab.get("id")
+        page_url = tab.get("url")
+
+        if tab_id and page_url and tab_id not in not_found_tabs:
+            if any(re.search(pattern, page_url) for pattern in WHITELISTED_PATTERNS):
+                print(f"Whitelisted: {page_url}")
+            else:
+                if tab_id in opened_tabs:
+                    if opened_tabs[tab_id]["page_url"] != page_url:
+                        opened_tabs[tab_id]["page_url"] = page_url
+                        opened_tabs[tab_id]["visited"] = False
+                else:
+                    opened_tabs[tab_id] = {"page_url": page_url, "visited": False, "tab": None}
+
+
+def attach_to_browser():
+    options = webdriver.ChromeOptions()
+    options.debugger_address = "localhost:9222"
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--remote-allow-origins=*")
+    options.add_argument("--window-size=1920,1080")
+    service = Service()
+
+    try:
+        driver = webdriver.Chrome(service=service, options=options)
+        return driver
+    except Exception as e:
+        print(f"Error attaching to browser: {e}")
+        return None
+
+def get_page_source(driver, tab):
+    driver.switch_to.window(tab)  # Switch to new tab
+    time.sleep(0.5)  # Allow content to load
+    page_url = driver.execute_script("return window.location.href;")
+    html_content = driver.execute_script("return document.documentElement.outerHTML;")
+    return page_url, html_content
 
 def get_active_browser_url_mac():
     try:
@@ -91,15 +156,11 @@ def get_active_browser_url_windows():
 
     return None
 
-def get_page_text(url):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        response = requests.get(url, headers=headers, timeout=5)
-        soup = BeautifulSoup(response.text, "html.parser")
-        return soup.get_text().strip().replace("\n", " ")
-    except requests.RequestException as e:
-        print(f"Error fetching page content: {e}")
+def extract_text_from_html(html):
+    if not html:
         return ""
+    soup = BeautifulSoup(html, "html.parser")
+    return soup.get_text().strip().replace("\n", " ")
 
 def get_image_urls(url):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -138,11 +199,19 @@ def get_image_urls(url):
 def is_nsfw_text(text):
     if not text:
         return False
-    print(text)
-    # print(text[:512])
-    result = text_pipe(text[:512])
-    print("Text:" , result)
-    return any(res["label"] == "NSFW" and res["score"] > 0.95 for res in result)
+
+    text = text.lower()
+    text = re.sub(r'\s+', ' ', text)
+    text = text.strip()
+
+    chunks = [text[i: i+512] for i in range(0, len(text), 512)]
+
+    for chunk in chunks:
+        result = text_pipe(chunk)
+        if any(res["label"] == "nsfw" and res["score"] > 0.7 for res in result):  # Lower threshold slightly
+            return True
+
+    return False
 
 def is_nsfw_image(image_url):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -162,53 +231,102 @@ def is_nsfw_image(image_url):
         print(f"Error processing image: {e}")
         return False
 
-def show_warning():
+def show_warning(page_url):
     notification.notify(
         title="Warning!",
-        message="This website contains explicit content and has been blocked.",
+        message=f"{page_url} contains explicit content and has been blocked.",
         timeout=5
     )
 
-def close_browser_tab_windows():
+def close_browser_tab(driver, url):
     try:
-        subprocess.run(["powershell", "-Command", "$wshell = New-Object -ComObject wscript.shell; $wshell.SendKeys('^w')"], check=True)
+        tabs = driver.window_handles
+        for tab in tabs:
+            driver.switch_to.window(tab)
+            if driver.current_url == url:
+                driver.close()
+                print(f"Closed NSFW tab: {url}")
+                break
+        driver.switch_to.window(tabs[0])  # Switch back to the first tab
     except Exception as e:
-        print(f"Could not close browser tab on Windows: {e}")
+        print(f"Could not close tab for {url}: {e}")
+
+def check_tab(driver, tab):
+    page_url, html_content = get_page_source(driver, tab)
+    print(f"Visiting {page_url}...")
+    text = extract_text_from_html(html_content)
+        # image_urls = get_image_urls(page_url)
+
+    if is_nsfw_text(text):
+        print(f"NSFW Content Detected in {page_url}")
+        close_browser_tab(driver, page_url)
+        show_warning(page_url)
+
+def is_tab_open(driver, tab_handle):
+    return tab_handle in driver.window_handles
 
     
 if __name__ == "__main__":
-    print(f"Monitoring browser activity on {os_type}...")
+    browser_process = is_browser_running()
+    if browser_process and not is_debugging_active():
+        restart_browser_with_devtools(browser_process)
 
-    while True:
-        match os_type:
-            case "Darwin":
-                url = get_active_browser_url_mac()
-            case "Windows":
-                browser_process = is_browser_running()
-                if browser_process and not is_debugging_active():
-                    restart_browser_with_devtools(browser_process)
+    if is_debugging_active():
+        print(f"Monitoring browser activity on {os_type}...")
 
-                open_urls = get_active_browser_url_windows() if is_debugging_active() else None
+        driver = attach_to_browser()
+        opened_tabs = {}
+        not_found_tabs = set()
 
-                if not previous_urls:
-                    urls_to_check = open_urls
-                else:
-                    urls_to_check = [url for url in open_urls if url not in previous_urls]
+        if not driver:
+            print("Failed to attach to browser. Make sure the browser is running in debugging mode.")
+            exit()
+        for tab in opened_tabs:
+            check_tab(driver, tab)
 
-                for url in urls_to_check:
-                    print(f"Checking URL: {url}")
-                    text = get_page_text(url)
-                    nsfw_text_detected = is_nsfw_text(text)
-                    # nsfw_image_detected = any(is_nsfw_image(img_url) for img_url in get_image_urls(url))
+        while True:
+            update_tab_urls(opened_tabs, not_found_tabs)
+            print(opened_tabs)
+            print(not_found_tabs)
 
-                    if nsfw_text_detected:
-                        print(f"NSFW content detected on {url}")
-                        # show_warning()
-                        # close_browser_tab_windows()
+            for tab_id, tab_info in list(opened_tabs.items()):
+                if not tab_info["visited"]:
+                    if tab_info["tab"] is None:
 
-                previous_urls.update(open_urls)
-                time.sleep(5)
+                        print(f"Opening {tab_info['page_url']}...")
+                        for handle in driver.window_handles:
+                            driver.switch_to.window(handle)
+                            if driver.current_url == tab_info["page_url"]:
+                                tab_info["tab"] = handle
+                                break
+                        if tab_info["tab"] is None:
+                            print("Tab not found.")
+                            not_found_tabs.add(tab_id)
+                            continue
 
-            case _:
-                print("Unsupported OS")
-                break
+                    if tab_info["tab"]:
+                        print(f"Checking {tab_info['page_url']}...")
+                        check_tab(driver, tab_info["tab"])
+                        tab_info["visited"] = True
+            # print("Checking for new tabs...")
+            # new_tabs = set(driver.window_handles) - opened_tabs
+            # if new_tabs:
+            #     if current_tab:
+            #         opened_tabs.add(current_tab)
+            #     current_tab = max(new_tabs, key=lambda x: int(x, 16))
+            #     print("Switching to new tab...")
+            #
+            # elif current_tab and not is_tab_open(driver, current_tab):
+            #     if opened_tabs:
+            #         current_tab = max(opened_tabs, key=lambda x: int(x, 16))
+            #         print("Switching to last opened tab...")
+            #
+            # elif not current_tab and opened_tabs and not new_tabs:
+            #     current_tab = max(opened_tabs, key=lambda x: int(x, 16))
+            #
+            # check_tab(driver, current_tab)
+            for tab_id in not_found_tabs:
+                if tab_id in opened_tabs:
+                    del opened_tabs[tab_id]
+            print(opened_tabs)
+            time.sleep(2)
