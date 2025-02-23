@@ -1,0 +1,14 @@
+whitelisted_patterns:
+  - "google\\.com"
+  - "wikipedia\\.org"
+  - "github\\.com"
+  - "stackoverflow\\.com"
+  - "youtube\\.com"
+  - "chatgpt\\.com"
+  - "chrome\\.com"
+  - "chrome\\-extensions"
+
+browser_processes:
+  chrome: "chrome.exe"
+  edge: "msedge.exe"
+  brave: "brave.exe"
